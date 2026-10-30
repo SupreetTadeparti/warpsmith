@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warpsmith"
+version = "0.1.0"
+description = "An LLM agent that optimizes CUDA kernels against a cheat-resistant evaluation harness"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6"]
+
+[project.optional-dependencies]
+# torch is required on the GPU machine but not listed as a hard dependency so that
+# installing on Colab/Kaggle doesn't replace the preinstalled CUDA build.
+gpu = ["torch"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["warpsmith"]
+
+[tool.setuptools.package-data]
+warpsmith = ["csrc/*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
