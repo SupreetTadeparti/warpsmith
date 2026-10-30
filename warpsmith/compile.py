@@ -46,14 +46,18 @@ class CompileResult:
         return cls(**d)
 
 
-def find_nvcc() -> str | None:
-    found = shutil.which("nvcc")
+def find_cuda_tool(name: str) -> str | None:
+    found = shutil.which(name)
     if found:
         return found
     for home in (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH"), "/usr/local/cuda"):
-        if home and (Path(home) / "bin" / "nvcc").exists():
-            return str(Path(home) / "bin" / "nvcc")
+        if home and (Path(home) / "bin" / name).exists():
+            return str(Path(home) / "bin" / name)
     return None
+
+
+def find_nvcc() -> str | None:
+    return find_cuda_tool("nvcc")
 
 
 _ENTRY_RE = re.compile(r"Compiling entry function '([^']+)'")

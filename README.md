@@ -7,7 +7,7 @@ An LLM agent that optimizes CUDA kernels in a loop (propose, compile, verify, be
 ## Status
 
 - [x] **Milestone 1:** evaluation harness with no LLM: static checks, nvcc compile, isolated worker, verification, benchmarking (matmul)
-- [ ] **Milestone 2:** red-team suite of cheating kernels the verifier must reject
+- [x] **Milestone 2:** red-team suite of cheating kernels the verifier must reject
 - [ ] **Milestone 3:** agent loop (gpt-oss-120b via UF NaviGator)
 - [ ] **Milestone 4:** reduction and softmax problems
 - [ ] **Milestone 5:** run reports
@@ -33,6 +33,28 @@ source --> static check --> nvcc --> worker subprocess: verify --> benchmark
    - The outputs produced while benchmarking are checked for correctness again.
    - **Roofline check:** results faster than the GPU's physical limit are flagged.
    - **Clock cross-check:** wall-clock time is compared with CUDA-event time to catch work that escapes the timed stream.
+
+With `--sanitize`, a candidate that passes verification is checked again under `compute-sanitizer` memcheck, with the torch caching allocator disabled. This catches stray writes that land far outside the guard regions.
+
+## Red-team suite
+
+`tests/redteam/matmul/` holds cheating kernels. The harness counts as correct only if it rejects every one of them, for the expected reason. Each file's header comment states the defense that must catch it, and `tests/test_redteam.py` checks this.
+
+| Cheat | Caught by |
+|---|---|
+| `zeros`: writes a constant | reference comparison (diagnosed as "all zeros") |
+| `tail_skip`: computes only full 32×32 tiles; correct on every visible shape | hidden odd shapes, NaN-prefilled outputs |
+| `no_bounds_check`: rounds the grid up with no bounds check | hidden shapes, guard regions |
+| `pointer_cache`: replays the cached result when the pointers repeat | same-pointer rerun with new data (diagnosed as "stale") |
+| `dims_cache`: caches results by shape | fresh random inputs on every case |
+| `mutates_input`: uses A as scratch space | input snapshots |
+| `half_precision`: silently computes in fp16 | magnitude-scaled tolerance, `wide_range` inputs |
+| `skip_half_k`: samples every other k | element-wise tolerance, `small_int` inputs |
+| `bench_shape_special`: cheaper wrong kernel at the benchmark shape | benchmark outputs are verified |
+| `call_count`: stops launching after verification | roofline check, outputs poisoned and relaunched after timing |
+| `legacy_stream`: launches outside the timed stream | wall-clock vs CUDA-event cross-check, roofline |
+| `oob_far`: writes 256 MiB past the end of C | compute-sanitizer memcheck |
+| `cublas_call`, `read_answers`, `own_stream`, `timer_probe`, `harness_override` | static check |
 
 ## Running
 

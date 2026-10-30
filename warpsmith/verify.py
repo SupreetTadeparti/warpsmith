@@ -106,17 +106,32 @@ def diagnose(out: torch.Tensor, expected: torch.Tensor, scale, rtol, atol, previ
     return notes
 
 
-def build_cases(problem: Problem) -> list[dict]:
+def case_numel(problem: Problem, dims: dict[str, int]) -> int:
+    total = 0
+    for a in problem.tensor_args:
+        n = 1
+        for d in a.resolve_shape(dims):
+            n *= d
+        total += n
+    return total
+
+
+def build_cases(problem: Problem, max_case_numel: int | None = None,
+                distributions: list[str] | None = None) -> list[dict]:
+    """All (shape, distribution) cases. The filters exist for slow modes like compute-sanitizer."""
     cases = []
     for hidden, shapes in ((False, problem.visible_shapes), (True, problem.hidden_shapes)):
         for dims in shapes:
-            for dist in problem.distributions:
+            if max_case_numel is not None and case_numel(problem, dims) > max_case_numel:
+                continue
+            for dist in distributions or problem.distributions:
                 cases.append({"dims": dict(dims), "hidden": hidden, "distribution": dist})
     return cases
 
 
-def verify(problem: Problem, ref, kernel: KernelLib, stream: torch.cuda.Stream) -> dict:
-    cases = build_cases(problem)
+def verify(problem: Problem, ref, kernel: KernelLib, stream: torch.cuda.Stream, *,
+           max_case_numel: int | None = None, distributions: list[str] | None = None) -> dict:
+    cases = build_cases(problem, max_case_numel, distributions)
     failures: list[dict] = []
     cases_run = 0
     fatal = False

@@ -29,13 +29,31 @@ def _bench_inputs(problem, ref, gen):
     return dims, sets
 
 
+def _check_bench_outputs(problem, sets, expected, when: str) -> dict | None:
+    from .verify import compare, unwritten_mask
+
+    for i, tensors in enumerate(sets):
+        exp, scale = expected[i]
+        for a in problem.outputs:
+            out = tensors[a.name]
+            n_unwritten = int(unwritten_mask(out).sum())
+            if n_unwritten:
+                return {"ok": False, "error": f"benchmark output {a.name} for input set {i} {when}: "
+                                              f"{n_unwritten}/{out.numel()} elements never written"}
+            r = compare(out, exp[a.name], scale[a.name], problem.rtol, problem.atol)
+            if not r["ok"]:
+                return {"ok": False, "error": f"benchmark output {a.name} for input set {i} {when} is wrong",
+                        "detail": r}
+    return None
+
+
 def _run_bench(problem, ref, launch_on_set, info, check_kernel=None) -> dict:
     """Time `launch_on_set(tensors, dims)`; afterwards re-check every set's output."""
     import secrets
     import torch
 
     from .bench import add_throughput, integrity_flags, make_flush_buffer, time_launches
-    from .verify import compare
+    from .verify import fill_sentinel
 
     gen = torch.Generator(device="cuda").manual_seed(secrets.randbits(63))
     dims, sets = _bench_inputs(problem, ref, gen)
@@ -46,17 +64,28 @@ def _run_bench(problem, ref, launch_on_set, info, check_kernel=None) -> dict:
     if check_kernel is not None and (err := check_kernel()):
         return {"ok": False, "error": f"launch error during benchmark: {err}"}
 
-    # The benchmarked outputs must be correct too: a kernel may not behave
-    # differently at the benchmark shape or when called back-to-back.
     scale_fn = getattr(ref, "tolerance_scale", None)
-    for i, tensors in enumerate(sets):
+    expected = []
+    for tensors in sets:
         inputs = {a.name: tensors[a.name] for a in problem.inputs}
-        expected = ref.reference(inputs, dims)
-        scale = scale_fn(inputs, dims) if scale_fn else {k: v.abs() for k, v in expected.items()}
+        exp = ref.reference(inputs, dims)
+        expected.append((exp, scale_fn(inputs, dims) if scale_fn else {k: v.abs() for k, v in exp.items()}))
+
+    # The benchmarked outputs must be correct too: a kernel may behave differently at
+    # the benchmark shape, or once it has been called more times than verification does.
+    if failure := _check_bench_outputs(problem, sets, expected, "after timed runs"):
+        return failure
+    # Outputs left over from warmup can look correct even if timed calls skipped work,
+    # so poison them and launch once more.
+    for tensors in sets:
         for a in problem.outputs:
-            r = compare(tensors[a.name], expected[a.name], scale[a.name], problem.rtol, problem.atol)
-            if not r["ok"]:
-                return {"ok": False, "error": f"benchmark output {a.name} for input set {i} is wrong", "detail": r}
+            fill_sentinel(tensors[a.name])
+    with torch.cuda.stream(stream):
+        for tensors in sets:
+            launch_on_set(tensors, dims, stream)
+    torch.cuda.synchronize()
+    if failure := _check_bench_outputs(problem, sets, expected, "on a fresh launch after benchmarking"):
+        return failure
 
     flops, nbytes = ref.flops(dims), ref.bytes_moved(dims)
     flags = integrity_flags(stats, flops, nbytes, info["peak_bandwidth_bytes_per_s"], info["peak_fp32_flops"])
@@ -96,7 +125,8 @@ def handle(job: dict) -> dict:
         return {"status": "error", "error": f"could not load kernel: {e}"}
 
     stream = torch.cuda.Stream()
-    result["verify"] = verify(problem, ref, kernel, stream)
+    result["verify"] = verify(problem, ref, kernel, stream,
+                              max_case_numel=job.get("max_case_numel"), distributions=job.get("distributions"))
     if result["verify"]["passed"] and job.get("bench", True):
         result["bench"] = _run_bench(
             problem, ref,

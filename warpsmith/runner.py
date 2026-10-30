@@ -20,14 +20,20 @@ def _tail(output: str | bytes | None) -> str:
     return (output or "")[-OUTPUT_TAIL:]
 
 
-def run_worker(job: dict, timeout: float = DEFAULT_TIMEOUT) -> dict:
-    env = dict(os.environ)
+def run_worker(
+    job: dict,
+    timeout: float = DEFAULT_TIMEOUT,
+    wrapper: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> dict:
+    """`wrapper` prefixes the command, e.g. compute-sanitizer and its flags."""
+    env = {**os.environ, **(extra_env or {})}
     env["PYTHONPATH"] = os.pathsep.join(p for p in (PACKAGE_PARENT, env.get("PYTHONPATH")) if p)
     with tempfile.TemporaryDirectory(prefix="warpsmith-") as d:
         job_path = Path(d) / "job.json"
         out_path = Path(d) / "result.json"
         job_path.write_text(json.dumps(job))
-        cmd = [sys.executable, "-m", "warpsmith.worker", str(job_path), str(out_path)]
+        cmd = [*(wrapper or []), sys.executable, "-m", "warpsmith.worker", str(job_path), str(out_path)]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired as e:
@@ -43,5 +49,6 @@ def run_worker(job: dict, timeout: float = DEFAULT_TIMEOUT) -> dict:
                 "stderr": _tail(proc.stderr),
             }
         result = json.loads(out_path.read_text())
+        result["returncode"] = proc.returncode
         result["stdout"] = _tail(proc.stdout)
         return result

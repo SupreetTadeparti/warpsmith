@@ -1,7 +1,7 @@
 """Command line interface.
 
     python -m warpsmith info
-    python -m warpsmith eval matmul path/to/kernel.cu [--no-bench] [--no-compare] [--json out.json]
+    python -m warpsmith eval matmul path/to/kernel.cu [--no-bench] [--sanitize] [--no-compare] [--json out.json]
     python -m warpsmith baseline matmul
 """
 
@@ -59,6 +59,11 @@ def print_result(name: str, r: EvalResult) -> None:
             print(f"          [{f['check']}] {where} dist={f['distribution']} round={f['round']}: {f['message']}")
             for note in f.get("diagnosis", []):
                 print(f"            -> {note}")
+    if r.sanitize:
+        s = r.sanitize
+        print(f"[sanitize] {'ok' if s['ok'] else 'FAIL  ' + s.get('error', '')}")
+        if not s["ok"] and s.get("report"):
+            print("\n".join("          " + ln for ln in s["report"].splitlines()))
     if r.bench:
         if r.bench.get("ok"):
             print(f"[bench]   {_fmt_bench(r.bench)}")
@@ -82,7 +87,7 @@ def cmd_baseline(args) -> int:
 def cmd_eval(args) -> int:
     problem = load_problem(args.problem)
     source = Path(args.kernel).read_text()
-    result = evaluate(problem, source, bench=not args.no_bench, arch=args.arch)
+    result = evaluate(problem, source, bench=not args.no_bench, sanitize=args.sanitize, arch=args.arch)
     print_result(args.kernel, result)
 
     report = {"candidate": result.to_dict()}
@@ -117,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("problem")
     p.add_argument("kernel")
     p.add_argument("--no-bench", action="store_true")
+    p.add_argument("--sanitize", action="store_true", help="also verify under compute-sanitizer memcheck (slow)")
     p.add_argument("--no-compare", action="store_true", help="skip naive/baseline comparison")
     p.add_argument("--arch", default="native")
     p.add_argument("--json", help="write the full result to this file")
