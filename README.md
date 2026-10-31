@@ -1,98 +1,50 @@
-# Warpsmith
+# warpsmith
 
-An LLM agent that optimizes CUDA kernels in a loop (propose, compile, verify, benchmark, repeat), evaluated by a harness that's built to be hard to cheat.
+An LLM agent that tries to make CUDA kernels faster. It writes a kernel, the harness compiles it, checks that it's correct, benchmarks it, and sends the results back so it can try again.
 
-> A *warp* is CUDA's 32-thread unit, and a smith reworks metal until it's right.
+Most of the work went into the checking part. LLMs will happily "optimize" a kernel by skipping work or caching results, so the harness tries hard to catch that.
 
-## Status
+## How it works
 
-- [x] **Milestone 1:** evaluation harness with no LLM: static checks, nvcc compile, isolated worker, verification, benchmarking (matmul)
-- [x] **Milestone 2:** red-team suite of cheating kernels the verifier must reject
-- [x] **Milestone 3:** agent loop (gpt-oss-120b via UF NaviGator)
-- [ ] **Milestone 4:** reduction and softmax problems
-- [ ] **Milestone 5:** run reports
+Each attempt goes through:
 
-## How a candidate is evaluated
+1. a source check (no cuBLAS, no extra streams, no file reads, etc.)
+2. `nvcc`
+3. correctness tests in a separate process, including hidden shapes the agent never sees
+4. benchmarking, with a few sanity checks on the timing
 
-```
-source --> static check --> nvcc --> worker subprocess: verify --> benchmark
-```
+The agent gets the current best kernel, a short history of past attempts, and feedback on the last one. A new best has to pass `compute-sanitizer` too.
 
-1. **Static check** (`warpsmith/static_check.py`): rejects calls to cuBLAS, cuDNN, Thrust and device-wide CUB; creating streams, events or graphs; synchronizing; host copies and allocations; file, process and environment access; GPU timer reads; and headers outside an allowlist.
-2. **Compile** (`warpsmith/compile.py`): `nvcc -O3 -shared -Xptxas -v` builds a shared library. The harness parses ptxas output for per-kernel registers, shared memory and spills.
-3. **Verify** (`warpsmith/verify.py`), in a subprocess so crashes and hangs are contained:
-   - **Hidden shapes:** the agent never sees them, and they include sizes that aren't multiples of a tile.
-   - **Fresh inputs:** a new random seed every run, drawn from several input distributions.
-   - **Sentinel-filled outputs:** outputs start as NaN, so skipped work shows up.
-   - **Guard regions:** canary bytes around every buffer catch out-of-bounds writes.
-   - **Read-only inputs:** input snapshots catch kernels that modify their inputs.
-   - **Same-pointer rerun:** every case runs a second time with new data in the same buffers, which catches cached results.
-   - **Tolerance:** results are compared against a float64 reference, with the tolerance scaled to the magnitude of the summed terms.
-4. **Benchmark** (`warpsmith/bench.py`):
-   - CUDA-event timing with the L2 cache flushed and input sets rotated; median and IQR are reported.
-   - The outputs produced while benchmarking are checked for correctness again.
-   - **Roofline check:** results faster than the GPU's physical limit are flagged.
-   - **Clock cross-check:** wall-clock time is compared with CUDA-event time to catch work that escapes the timed stream.
+## Catching cheats
 
-With `--sanitize`, a candidate that passes verification is checked again under `compute-sanitizer` memcheck, with the torch caching allocator disabled. This catches stray writes that land far outside the guard regions.
+`tests/redteam/` has a set of kernels that cheat in different ways, like writing zeros, caching results by pointer, using fp16 or launching on a different stream. The tests make sure every one of them gets rejected.
 
-## The agent loop
+## First results
 
-`warpsmith/agent.py` and `warpsmith/prompts.py`. Each iteration builds a **fresh** prompt instead of growing a chat. It contains:
-- the problem, the GPU's specs and the rules;
-- the current best kernel, with its timing and ptxas resource usage;
-- a one-line-per-attempt history table;
-- full feedback on the last attempt, plus its source code if it failed.
+matmul, 2048x2048, Tesla T4, gpt-oss-120b, 10 iterations:
 
-The context therefore stays bounded however many iterations run.
-
-- **Hidden shapes stay hidden.** Failures on hidden shapes are described by their properties (for example "a dimension that is not a multiple of 32" or "a very skinny shape"). Exact sizes, indices and element counts are never shown.
-- **A new best has to earn it.** It must beat the current best by more than 1% (benchmark noise is about 0.2%), then pass compute-sanitizer memcheck.
-- **Everything is logged.** Each run writes `runs/<problem>-<timestamp>/` containing every prompt, response and kernel, plus `attempts.jsonl`, `best.cu` and `summary.json`.
-
-```bash
-export NAVIGATOR_API_KEY=...   # or a Colab/Kaggle secret, never committed
-python -m warpsmith llm-check
-python -m warpsmith agent matmul --iterations 10 [--patience 4] [--reasoning-effort high]
-```
-
-## Red-team suite
-
-`tests/redteam/matmul/` holds cheating kernels. The harness counts as correct only if it rejects every one of them, for the expected reason. Each file's header comment states the defense that must catch it, and `tests/test_redteam.py` checks this.
-
-| Cheat | Caught by |
+| kernel | time |
 |---|---|
-| `zeros`: writes a constant | reference comparison (diagnosed as "all zeros") |
-| `tail_skip`: computes only full 32×32 tiles; correct on every visible shape | hidden odd shapes, NaN-prefilled outputs |
-| `no_bounds_check`: rounds the grid up with no bounds check | hidden shapes, guard regions |
-| `pointer_cache`: replays the cached result when the pointers repeat | same-pointer rerun with new data (diagnosed as "stale") |
-| `dims_cache`: caches results by shape | fresh random inputs on every case |
-| `mutates_input`: uses A as scratch space | input snapshots |
-| `half_precision`: silently computes in fp16 | magnitude-scaled tolerance, `wide_range` inputs |
-| `skip_half_k`: samples every other k | element-wise tolerance, `small_int` inputs |
-| `bench_shape_special`: cheaper wrong kernel at the benchmark shape | benchmark outputs are verified |
-| `call_count`: stops launching after verification | roofline check, outputs poisoned and relaunched after timing |
-| `legacy_stream`: launches outside the timed stream | wall-clock vs CUDA-event cross-check, roofline |
-| `oob_far`: writes 256 MiB past the end of C | compute-sanitizer memcheck |
-| `cublas_call`, `read_answers`, `own_stream`, `timer_probe`, `harness_override` | static check |
+| naive | 143.7 ms |
+| agent's best | 25.0 ms |
+| cuBLAS | 4.0 ms |
 
-## Running
+The agent got stuck because it only sees timings, not why a kernel is slow. Profiler feedback is next.
 
-The development machine has no NVIDIA GPU, so anything that touches the GPU runs on Colab or Kaggle. Use `notebooks/run_colab.ipynb`.
+## Running it
+
+I don't have an NVIDIA GPU, so I run everything on Colab with `notebooks/run_colab.ipynb`.
 
 ```bash
 pip install -e ".[dev]"
-python -m warpsmith info                                    # GPU and peak specs
-python -m warpsmith eval matmul examples/matmul/tiled.cu    # full pipeline + comparison to naive & cuBLAS
-python -m warpsmith baseline matmul                         # cuBLAS (torch.matmul) timing
-python -m pytest -q                                         # GPU tests skip without nvcc
+python -m warpsmith eval matmul examples/matmul/tiled.cu
+python -m warpsmith agent matmul --iterations 10
 ```
 
-## Adding a problem
+The agent needs `NAVIGATOR_API_KEY` set (UF NaviGator, OpenAI-compatible API).
 
-Create `problems/<name>/` with three files:
-- `spec.yaml`: the launcher signature, args, tolerance, and the visible, hidden and benchmark shapes.
-- `naive.cu`: the starting kernel.
-- `reference.py`: defines `make_inputs`, `reference` (float64), `baseline`, `flops`, `bytes_moved`, and optionally `tolerance_scale`.
+## TODO
 
-See `problems/matmul/` for an example.
+- profiler (ncu) feedback
+- reduction and softmax problems
+- run reports
