@@ -8,7 +8,7 @@ An LLM agent that optimizes CUDA kernels in a loop (propose, compile, verify, be
 
 - [x] **Milestone 1:** evaluation harness with no LLM: static checks, nvcc compile, isolated worker, verification, benchmarking (matmul)
 - [x] **Milestone 2:** red-team suite of cheating kernels the verifier must reject
-- [ ] **Milestone 3:** agent loop (gpt-oss-120b via UF NaviGator)
+- [x] **Milestone 3:** agent loop (gpt-oss-120b via UF NaviGator)
 - [ ] **Milestone 4:** reduction and softmax problems
 - [ ] **Milestone 5:** run reports
 
@@ -35,6 +35,26 @@ source --> static check --> nvcc --> worker subprocess: verify --> benchmark
    - **Clock cross-check:** wall-clock time is compared with CUDA-event time to catch work that escapes the timed stream.
 
 With `--sanitize`, a candidate that passes verification is checked again under `compute-sanitizer` memcheck, with the torch caching allocator disabled. This catches stray writes that land far outside the guard regions.
+
+## The agent loop
+
+`warpsmith/agent.py` and `warpsmith/prompts.py`. Each iteration builds a **fresh** prompt instead of growing a chat. It contains:
+- the problem, the GPU's specs and the rules;
+- the current best kernel, with its timing and ptxas resource usage;
+- a one-line-per-attempt history table;
+- full feedback on the last attempt, plus its source code if it failed.
+
+The context therefore stays bounded however many iterations run.
+
+- **Hidden shapes stay hidden.** Failures on hidden shapes are described by their properties (for example "a dimension that is not a multiple of 32" or "a very skinny shape"). Exact sizes, indices and element counts are never shown.
+- **A new best has to earn it.** It must beat the current best by more than 1% (benchmark noise is about 0.2%), then pass compute-sanitizer memcheck.
+- **Everything is logged.** Each run writes `runs/<problem>-<timestamp>/` containing every prompt, response and kernel, plus `attempts.jsonl`, `best.cu` and `summary.json`.
+
+```bash
+export NAVIGATOR_API_KEY=...   # or a Colab/Kaggle secret, never committed
+python -m warpsmith llm-check
+python -m warpsmith agent matmul --iterations 10 [--patience 4] [--reasoning-effort high]
+```
 
 ## Red-team suite
 

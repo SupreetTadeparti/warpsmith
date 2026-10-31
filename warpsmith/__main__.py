@@ -3,6 +3,8 @@
     python -m warpsmith info
     python -m warpsmith eval matmul path/to/kernel.cu [--no-bench] [--sanitize] [--no-compare] [--json out.json]
     python -m warpsmith baseline matmul
+    python -m warpsmith llm-check
+    python -m warpsmith agent matmul --iterations 10
 """
 
 from __future__ import annotations
@@ -108,6 +110,43 @@ def cmd_eval(args) -> int:
     return 0 if result.passed else 1
 
 
+def cmd_llm_check(args) -> int:
+    from .llm import LLMClient, LLMError
+
+    try:
+        llm = LLMClient(model=args.model, max_tokens=2000)
+        resp = llm.complete([{"role": "user", "content": "Reply with exactly: ok"}])
+    except LLMError as e:
+        print(f"LLM check failed: {e}")
+        return 1
+    print(f"endpoint: {llm.endpoints[0]}\nmodel: {llm.model}\nreply: {resp.text.strip()!r}\n"
+          f"tokens: {resp.prompt_tokens} in / {resp.completion_tokens} out, {resp.seconds}s")
+    return 0
+
+
+def cmd_agent(args) -> int:
+    import time
+
+    from .agent import Agent, AgentConfig
+    from .llm import LLMClient
+
+    problem = load_problem(args.problem)
+    run_dir = Path(args.run_dir) / f"{problem.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    llm = LLMClient(model=args.model, reasoning_effort=args.reasoning_effort)
+    config = AgentConfig(iterations=args.iterations, patience=args.patience, sanitize_best=not args.no_sanitize)
+    print(f"run directory: {run_dir}")
+    summary = Agent(problem, llm, run_dir, config).run()
+
+    print("== summary")
+    print(f"  best {summary['best_ms']:.4f} ms (attempt {summary['best_iteration']}), "
+          f"{summary['speedup_vs_naive']:.2f}x naive"
+          + (f", {summary['fraction_of_baseline']:.2f}x of baseline speed" if summary["fraction_of_baseline"] else ""))
+    print(f"  outcomes: {summary['outcomes']}")
+    print(f"  tokens: {summary['prompt_tokens']} in / {summary['completion_tokens']} out, {summary['wall_seconds']}s")
+    print(f"  best kernel: {run_dir / 'best.cu'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="warpsmith")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -127,6 +166,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--arch", default="native")
     p.add_argument("--json", help="write the full result to this file")
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("llm-check", help="send one tiny request to the LLM endpoint")
+    p.add_argument("--model")
+    p.set_defaults(func=cmd_llm_check)
+
+    p = sub.add_parser("agent", help="run the optimization agent on a problem")
+    p.add_argument("problem")
+    p.add_argument("--iterations", type=int, default=10)
+    p.add_argument("--patience", type=int, help="stop after this many attempts without improvement")
+    p.add_argument("--model", help="defaults to $WARPSMITH_MODEL or gpt-oss-120b")
+    p.add_argument("--reasoning-effort", choices=["low", "medium", "high"],
+                   help="passed through to models that support it")
+    p.add_argument("--no-sanitize", action="store_true", help="skip memcheck on new best kernels")
+    p.add_argument("--run-dir", default="runs")
+    p.set_defaults(func=cmd_agent)
 
     args = parser.parse_args(argv)
     return args.func(args)
