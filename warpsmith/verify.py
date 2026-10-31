@@ -167,7 +167,9 @@ def verify(problem: Problem, ref, kernel: KernelLib, stream: torch.cuda.Stream, 
             try:
                 torch.cuda.synchronize()
             except RuntimeError as e:
-                fail("runtime_error", f"CUDA error during kernel execution: {e}")
+                # torch appends several lines of debugging advice; keep only the error itself.
+                reason = str(e).strip().splitlines()[0].removeprefix("CUDA error: ")
+                fail("runtime_error", f"CUDA error during kernel execution: {reason}")
                 fatal = True  # the CUDA context is now unusable
                 break
             if launch_err:
